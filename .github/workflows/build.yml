@@ -1,0 +1,89 @@
+name: Build Kupfer Image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y python3 python3-pip python3-venv git xz-utils util-linux e2fsprogs patch
+
+      - name: Install kupferbootstrap
+        run: |
+          git clone -b prawn/chroot_wrapper https://gitlab.com/kupfer/kupferbootstrap.git
+          cd kupferbootstrap
+          python3 -m venv venv
+          source venv/bin/activate
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e .
+
+      - name: Prepare kupferbootstrap config
+        run: |
+          mkdir -p /home/runner/.config/kupfer
+          cp kupferbootstrap.toml /home/runner/.config/kupfer/kupferbootstrap.toml
+
+      - name: Update PKGBUILDs
+        run: |
+          cd kupferbootstrap
+          source venv/bin/activate
+          kupferbootstrap packages update
+
+      - name: Apply patch to PKGBUILDs
+        run: |
+          cp patches/gitlab.com/kupfer/packages/pkgbuilds/0001-porting-sm8250-alioth.patch /tmp/0001-porting-sm8250-alioth.patch
+          cd /home/runner/.cache/kupfer/pkgbuilds
+          patch -Np1 < /tmp/0001-porting-sm8250-alioth.patch
+
+      - name: Generate SSH key for kupfer
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -f ~/.ssh/id_ed25519_kupfer -t ed25519 -C "kupfer" -N ""
+
+      - name: Build Image
+        run: |
+          cd kupferbootstrap
+          source venv/bin/activate
+          kupferbootstrap image build
+
+      - name: Extract aboot
+        run: |
+          cd kupferbootstrap
+          source venv/bin/activate
+          DEVICE=$(kupferbootstrap config get profiles.default.device)
+          FLAVOUR=$(kupferbootstrap config get profiles.default.flavour)
+          PREFIX="${DEVICE}-${FLAVOUR}"
+          BOOT_IMG="${PREFIX}-boot.img"
+          ABOOT_OUT="${PREFIX}-aboot.img"
+          cd /home/runner/.cache/kupfer/images
+          mkdir -p tmp/boot
+          sudo mount -o loop,ro "$BOOT_IMG" tmp/boot
+          cp tmp/boot/aboot.img "$ABOOT_OUT"
+          sudo umount tmp/boot
+
+      - name: Compress images
+        run: |
+          cd /home/runner/.cache/kupfer/images
+          for img in *.img; do
+            xz -T0 -9 -k "$img"
+          done
+
+      - name: Create Release Tag
+        id: tag
+        run: |
+          echo "tag=v$(date +'%Y.%m.%d-%H%M')" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            /home/runner/.cache/kupfer/images/*.xz
+            /home/runner/.cache/kupfer/packages/aarch64/linux/*
